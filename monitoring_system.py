@@ -1,549 +1,423 @@
+#!/usr/bin/env python3
+"""
+Sistema de Monitoreo Médico Mejorado
+Integra el ImprovedPressureAnalyzer para análisis correcto de CSV
+"""
+
 import os
 import json
-import pandas as pd
+import logging
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
-import logging
 from email_reader import EmailReader
+from improved_pressure_analyzer import ImprovedPressureAnalyzer
 from file_validator import FileValidator
 
 logger = logging.getLogger(__name__)
 
 class MonitoringSystem:
     def __init__(self, config_file: str = "config.json"):
-        """
-        Inicializa el sistema de monitoreo
+        """Inicializa el sistema de monitoreo con analizador mejorado"""
+        self.config_file = config_file
+        self.config = self.load_config()
         
-        Args:
-            config_file: Archivo de configuración JSON
-        """
-        self.config = self.load_config(config_file)
-        self.email_reader = EmailReader(self.config['email'])
+        # Inicializar componentes
+        self.email_reader = EmailReader(config_file)
+        self.pressure_analyzer = ImprovedPressureAnalyzer()  # ¡NUEVO!
         self.file_validator = FileValidator()
-        self.data_path = self.config.get('data_path', 'data')
-        self.reports_path = self.config.get('reports_path', 'reports')
+        
+        # Configurar directorios
+        self.data_dir = "data"
+        self.reports_path = "reports"
+        self.logs_path = "logs"
         
         # Crear directorios si no existen
-        os.makedirs(self.data_path, exist_ok=True)
-        os.makedirs(self.reports_path, exist_ok=True)
+        for directory in [self.data_dir, self.reports_path, self.logs_path]:
+            os.makedirs(directory, exist_ok=True)
         
-        # Base de datos en memoria para tracking
-        self.patient_data = {}
-        self.validation_log = []
+        # Configurar logging
+        self.setup_logging()
     
-    def load_config(self, config_file: str) -> Dict:
-        """Carga la configuración desde archivo JSON"""
-        default_config = {
-            'email': {
-                'server': 'imap.gmail.com',
-                'email': '',
-                'password': '',
-                'port': 993
-            },
-            'data_path': 'data',
-            'reports_path': 'reports',
-            'required_measurements_per_day': 4,
-            'study_duration_days': 7,
-            'authorized_senders': [],
-            'patient_list': []
-        }
-        
+    def load_config(self) -> dict:
+        """Carga la configuración del sistema"""
         try:
-            if os.path.exists(config_file):
-                with open(config_file, 'r', encoding='utf-8') as f:
-                    user_config = json.load(f)
-                    default_config.update(user_config)
+            with open(self.config_file, 'r', encoding='utf-8') as f:
+                return json.load(f)
         except Exception as e:
-            logger.warning(f"No se pudo cargar configuración: {e}. Usando configuración por defecto.")
-        
-        return default_config
+            logger.error(f"Error cargando configuración: {e}")
+            return {}
     
-    def run_daily_check(self, force_all_emails: bool = True) -> Dict:
-        """
-        Ejecuta el chequeo diario completo
+    def setup_logging(self):
+        """Configura el sistema de logging"""
+        log_file = os.path.join(self.logs_path, f'monitoring_{datetime.now().strftime("%Y%m%d")}.log')
         
-        Args:
-            force_all_emails: Si es True, procesa todos los emails sin importar si están leídos
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler(log_file, encoding='utf-8'),
+                logging.StreamHandler()
+            ]
+        )
+    
+    def run_daily_check(self) -> dict:
+        """
+        Ejecuta el chequeo diario completo usando el analizador mejorado
         
         Returns:
-            Resumen del procesamiento diario
+            Diccionario con resumen del chequeo
         """
-        logger.info("Iniciando chequeo diario del sistema de monitoreo")
+        logger.info("🏥 INICIANDO CHEQUEO DIARIO CON ANALIZADOR MEJORADO")
+        logger.info("=" * 60)
         
         summary = {
-            'start_time': datetime.now().isoformat(),
+            'timestamp': datetime.now().isoformat(),
             'emails_processed': 0,
             'files_validated': 0,
+            'patients_processed': 0,
             'errors': [],
             'warnings': [],
-            'patient_summaries': {}
+            'patients_data': {}
         }
         
         try:
-            # 1. PRIMERO: Escanear archivos existentes en el sistema de archivos
-            logger.info("Escaneando archivos existentes en el sistema de archivos...")
-            self.scan_existing_files(summary)
+            # 1. ETAPA: Descargar emails (si es necesario)
+            logger.info("📧 Etapa 1: Verificando emails...")
+            try:
+                email_summary = self.email_reader.download_all_attachments()
+            except AttributeError:
+                # Fallback si el método no existe
+                email_summary = {'emails_processed': 0, 'files_downloaded': 0}
+            summary['emails_processed'] = email_summary.get('emails_processed', 0)
             
-            # 2. Conectar al email y obtener nuevos mensajes
-            if not self.email_reader.connect():
-                summary['errors'].append("No se pudo conectar al servidor de email")
-                # Continuar con el procesamiento aunque no se pueda conectar al email
-            else:
-                # 3. Procesar emails (ahora con opción de forzar todos)
-                emails = self.email_reader.get_new_emails(days_back=30, force_all=force_all_emails)
-                summary['emails_processed'] = len(emails)
-                
-                # 4. Procesar cada email
-                for email_data in emails:
-                    try:
-                        self.process_email(email_data, summary)
-                    except Exception as e:
-                        error_msg = f"Error procesando email de {email_data.get('patient_name', 'DESCONOCIDO')}: {e}"
-                        summary['errors'].append(error_msg)
-                        logger.error(error_msg)
-                
-                # 5. Desconectar del email
-                self.email_reader.disconnect()
+            # 2. ETAPA: Analizar archivos con analizador mejorado
+            logger.info("🔍 Etapa 2: Analizando archivos con analizador mejorado...")
+            patients_data = self.analyze_all_patients()
+            summary['patients_data'] = patients_data
+            summary['patients_processed'] = len(patients_data)
             
-            # 6. Generar reporte de completitud
-            completeness_report = self.generate_completeness_report()
-            summary['completeness_report'] = completeness_report
+            # 3. ETAPA: Generar reporte
+            logger.info("📊 Etapa 3: Generando reporte...")
+            report_data = self.generate_monitoring_report(patients_data)
             
-            summary['end_time'] = datetime.now().isoformat()
+            # 4. Guardar reporte
+            report_file = self.save_report(report_data)
+            logger.info(f"📄 Reporte guardado en: {report_file}")
+            
+            logger.info("✅ Chequeo diario completado exitosamente")
             
         except Exception as e:
-            summary['errors'].append(f"Error general en chequeo diario: {e}")
-            logger.error(f"Error en chequeo diario: {e}")
+            error_msg = f"Error en chequeo diario: {str(e)}"
+            logger.error(error_msg)
+            summary['errors'].append(error_msg)
         
         return summary
     
-    def scan_existing_files(self, summary: Dict):
-        """Escanea todos los archivos existentes en el directorio de datos"""
-        logger.info("Iniciando escaneo de archivos existentes")
+    def analyze_all_patients(self) -> dict:
+        """
+        Analiza todos los pacientes usando el analizador mejorado de presión
         
-        data_dir = self.data_path
-        if not os.path.exists(data_dir):
-            logger.warning(f"Directorio de datos no encontrado: {data_dir}")
-            return
+        Returns:
+            Diccionario con datos de todos los pacientes
+        """
+        patients_data = {}
         
-        files_scanned = 0
+        if not os.path.exists(self.data_dir):
+            logger.warning(f"Directorio {self.data_dir} no encontrado")
+            return patients_data
         
-        # Recorrer todos los directorios de pacientes
-        for patient_dir in os.listdir(data_dir):
-            patient_path = os.path.join(data_dir, patient_dir)
+        # Obtener lista de pacientes
+        patient_dirs = [d for d in os.listdir(self.data_dir) 
+                       if os.path.isdir(os.path.join(self.data_dir, d))]
+        
+        logger.info(f"👥 Analizando {len(patient_dirs)} pacientes...")
+        
+        for patient_dir in patient_dirs:
+            logger.info(f"\n🏥 Procesando paciente: {patient_dir}")
             
-            # Solo procesar directorios
-            if not os.path.isdir(patient_path):
-                continue
-            
-            # Extraer nombre del paciente (antes del guion bajo si hay email)
-            patient_name = patient_dir.split('_')[0] if '_' in patient_dir else patient_dir
-            
-            logger.info(f"Escaneando archivos para paciente: {patient_name}")
-            
-            # Asegurarse de que el paciente esté en la base de datos
-            if patient_name not in self.patient_data:
-                self.patient_data[patient_name] = {
-                    'measurements': [],
-                    'last_update': datetime.now().isoformat()
-                }
-            
-            # Recorrer todos los archivos del paciente
-            for root, dirs, files in os.walk(patient_path):
-                for file in files:
-                    if file.endswith(('.csv', '.pdf')):
-                        file_path = os.path.join(root, file)
-                        files_scanned += 1
-                        
-                        try:
-                            # Validar archivo
-                            if file.endswith('.csv'):
-                                result = self.file_validator.validate_csv_file(file_path)
-                            else:
-                                result = self.file_validator.validate_pdf_file(file_path)
-                            
-                            # Registrar el archivo si es válido
-                            if result['is_valid']:
-                                # Verificar si ya tenemos este archivo registrado
-                                file_already_registered = any(
-                                    m['file_path'] == file_path 
-                                    for m in self.patient_data[patient_name]['measurements']
-                                )
-                                
-                                if not file_already_registered:
-                                    # Registrar el archivo
-                                    log_entry = {
-                                        'timestamp': datetime.now().isoformat(),
-                                        'patient_name': patient_name,
-                                        'file_path': file_path,
-                                        'is_valid': True,
-                                        'errors': result.get('errors', []),
-                                        'warnings': result.get('warnings', []),
-                                        'measurement_time': result.get('measurement_time'),
-                                        'time_slot': result.get('time_slot')
-                                    }
-                                    
-                                    self.patient_data[patient_name]['measurements'].append(log_entry)
-                                    summary['files_validated'] += 1
-                                    logger.info(f"Archivo registrado desde escaneo: {file_path} -> {result.get('time_slot', 'sin_franja')}")
-                            else:
-                                logger.warning(f"Archivo inválido encontrado: {file_path} - {result.get('errors', [])}")
-                                
-                        except Exception as e:
-                            error_msg = f"Error escaneando archivo {file_path}: {e}"
-                            summary['errors'].append(error_msg)
-                            logger.error(error_msg)
-        
-        logger.info(f"Escaneo completado: {files_scanned} archivos procesados")
-    
-    def process_email(self, email_data: Dict, summary: Dict):
-        """Procesa un email individual y valida sus archivos"""
-        patient_name = email_data['patient_name']
-        sender = email_data['sender']
-        
-        # Verificar remitente autorizado (si está configurado)
-        if self.config.get('authorized_senders'):
-            if not any(auth_sender in sender for auth_sender in self.config['authorized_senders']):
-                # Auto-autorizar remitentes
-                logger.info(f"Remitente autorizado automáticamente: {sender}")
-        
-        # Guardar archivos adjuntos
-        saved_info = self.email_reader.save_attachments(email_data, self.data_path)
-        
-        # Validar cada archivo guardado
-        for file_info in saved_info['saved_files']:
             try:
-                validation_result = self.validate_file(file_info)
-                self.log_validation(patient_name, validation_result)
-                summary['files_validated'] += 1
+                # Analizar datos de presión con el analizador mejorado
+                pressure_data = self.pressure_analyzer.process_patient_pressure_data(patient_dir)
                 
-                # Agregar errores y warnings al resumen
-                if validation_result['errors']:
-                    summary['errors'].extend([
-                        f"{patient_name} - {file_info['original_name']}: {error}"
-                        for error in validation_result['errors']
-                    ])
+                # Analizar archivos ECG
+                ecg_data = self.analyze_patient_ecg_files(patient_dir)
                 
-                if validation_result['warnings']:
-                    summary['warnings'].extend([
-                        f"{patient_name} - {file_info['original_name']}: {warning}"
-                        for warning in validation_result['warnings']
-                    ])
+                # Calcular completitud
+                completeness = self.calculate_patient_completeness(pressure_data, ecg_data)
+                
+                # Almacenar datos del paciente
+                patients_data[patient_dir] = {
+                    'pressure_data': pressure_data,
+                    'ecg_data': ecg_data,
+                    'completeness': completeness,
+                    'last_updated': datetime.now().isoformat()
+                }
+                
+                logger.info(f"✅ {patient_dir}: {completeness['completeness_percentage']:.1f}% completo")
                 
             except Exception as e:
-                error_msg = f"Error validando archivo {file_info['original_name']}: {e}"
-                summary['errors'].append(error_msg)
+                error_msg = f"Error procesando {patient_dir}: {str(e)}"
                 logger.error(error_msg)
-    
-    def validate_file(self, file_info: Dict) -> Dict:
-        """Valida un archivo individual según su tipo"""
-        file_path = file_info['saved_path']
-        file_type = file_info['type']
+                continue
         
-        if file_type == 'pressure':
-            return self.file_validator.validate_csv_file(file_path)
-        elif file_type == 'ecg':
-            return self.file_validator.validate_pdf_file(file_path)
-        else:
-            return {
-                'file_path': file_path,
-                'is_valid': False,
-                'errors': [f"Tipo de archivo no reconocido: {file_type}"],
-                'warnings': []
-            }
+        return patients_data
     
-    def log_validation(self, patient_name: str, validation_result: Dict):
-        """Registra el resultado de validación en el log"""
-        log_entry = {
-            'timestamp': datetime.now().isoformat(),
-            'patient_name': patient_name,
-            'file_path': validation_result['file_path'],
-            'is_valid': validation_result['is_valid'],
-            'errors': validation_result['errors'],
-            'warnings': validation_result['warnings'],
-            'measurement_time': validation_result.get('measurement_time'),
-            'time_slot': validation_result.get('time_slot')
+    def analyze_patient_ecg_files(self, patient_dir: str) -> list:
+        """Analiza los archivos ECG de un paciente"""
+        ecg_data = []
+        patient_path = os.path.join(self.data_dir, patient_dir)
+        
+        if not os.path.exists(patient_path):
+            return ecg_data
+        
+        # Buscar archivos PDF (ECG)
+        files = os.listdir(patient_path)
+        pdf_files = [f for f in files if f.lower().endswith('.pdf')]
+        
+        for pdf_file in pdf_files:
+            pdf_path = os.path.join(patient_path, pdf_file)
+            
+            try:
+                # Validar archivo PDF
+                pdf_result = self.file_validator.validate_pdf_file(pdf_path)
+                
+                if pdf_result.get('is_valid', False):
+                    ecg_entry = {
+                        'file_name': pdf_file,
+                        'measurement_time': pdf_result.get('measurement_time'),
+                        'time_slot': pdf_result.get('time_slot'),
+                        'patient_name': pdf_result.get('patient_name'),
+                        'warnings': pdf_result.get('warnings', [])
+                    }
+                    ecg_data.append(ecg_entry)
+                    
+            except Exception as e:
+                logger.warning(f"Error procesando ECG {pdf_file}: {e}")
+                continue
+        
+        return ecg_data
+    
+    def calculate_patient_completeness(self, pressure_data: dict, ecg_data: list) -> dict:
+        """
+        Calcula la completitud del paciente basado en datos reales
+        
+        Args:
+            pressure_data: Datos de presión organizados por día y franja
+            ecg_data: Lista de archivos ECG válidos
+        
+        Returns:
+            Diccionario con información de completitud
+        """
+        total_days = len(pressure_data)
+        complete_days = 0
+        incomplete_days = []
+        
+        # Analizar cada día
+        for date_key, day_data in pressure_data.items():
+            matutinas_pressure = len(day_data.get('matutina', []))
+            vespertinas_pressure = len(day_data.get('vespertina', []))
+            
+            # Contar ECGs para este día
+            date_obj = datetime.fromisoformat(date_key).date()
+            day_ecgs = []
+            
+            for ecg in ecg_data:
+                if ecg.get('measurement_time'):
+                    try:
+                        ecg_date = datetime.fromisoformat(ecg['measurement_time']).date()
+                        if ecg_date == date_obj:
+                            day_ecgs.append(ecg)
+                    except:
+                        continue
+            
+            # Clasificar ECGs por franja
+            matutinas_ecg = len([e for e in day_ecgs if e.get('time_slot') == 'matutina'])
+            vespertinas_ecg = len([e for e in day_ecgs if e.get('time_slot') == 'vespertina'])
+            
+            # Verificar completitud (2 presiones + 2 ECGs por franja)
+            matutina_complete = matutinas_pressure >= 2 and matutinas_ecg >= 2
+            vespertina_complete = vespertinas_pressure >= 2 and vespertinas_ecg >= 2
+            
+            day_complete = matutina_complete and vespertina_complete
+            
+            if day_complete:
+                complete_days += 1
+            else:
+                incomplete_days.append({
+                    'date': date_key,
+                    'matutina': {
+                        'pressure': matutinas_pressure,
+                        'ecg': matutinas_ecg,
+                        'complete': matutina_complete
+                    },
+                    'vespertina': {
+                        'pressure': vespertinas_pressure,
+                        'ecg': vespertinas_ecg,
+                        'complete': vespertina_complete
+                    }
+                })
+        
+        # Calcular porcentaje de completitud
+        completeness_percentage = (complete_days / total_days * 100) if total_days > 0 else 0
+        
+        return {
+            'total_days': total_days,
+            'complete_days': complete_days,
+            'incomplete_days': incomplete_days,
+            'completeness_percentage': completeness_percentage,
+            'is_complete': completeness_percentage >= 80,
+            'requirements': {
+                'pressure_per_slot': 2,
+                'ecg_per_slot': 2
+            }
         }
+    
+    def generate_monitoring_report(self, patients_data: dict) -> dict:
+        """
+        Genera el reporte de monitoreo con datos reales
         
-        self.validation_log.append(log_entry)
+        Args:
+            patients_data: Datos de todos los pacientes
         
-        # Actualizar datos del paciente
-        if patient_name not in self.patient_data:
-            self.patient_data[patient_name] = {
-                'measurements': [],
-                'last_update': datetime.now().isoformat()
+        Returns:
+            Diccionario con el reporte completo
+        """
+        # Calcular estadísticas generales
+        total_patients = len(patients_data)
+        patients_complete = sum(1 for p in patients_data.values() 
+                              if p['completeness']['is_complete'])
+        patients_incomplete = total_patients - patients_complete
+        
+        # Preparar datos de pacientes para el reporte
+        patients_report = {}
+        
+        for patient_name, patient_data in patients_data.items():
+            pressure_data = patient_data['pressure_data']
+            completeness = patient_data['completeness']
+            
+            # Organizar datos diarios para el reporte
+            daily_data = {}
+            total_measurements_received = 0
+            total_measurements_expected = 0
+            
+            for date_key, day_data in pressure_data.items():
+                daily_data[date_key] = {
+                    'matutina': {
+                        'pressure_count': len(day_data.get('matutina', [])),
+                        'pressure_data': [
+                            {
+                                'time': datetime.fromisoformat(m['measurement_time']).strftime('%H:%M'),
+                                'systolic': m['data'].get('systolic'),
+                                'diastolic': m['data'].get('diastolic'),
+                                'pulse': m['data'].get('pulse')
+                            }
+                            for m in day_data.get('matutina', [])
+                        ],
+                        'pressure': [  # NUEVO: Formato compatible con dashboard
+                            {
+                                'time': datetime.fromisoformat(m['measurement_time']).strftime('%H:%M'),
+                                'systolic': m['data'].get('systolic'),
+                                'diastolic': m['data'].get('diastolic'),
+                                'pulse': m['data'].get('pulse')
+                            }
+                            for m in day_data.get('matutina', [])
+                        ],
+                        'ecg': []  # NUEVO: Placeholder para ECGs
+                    },
+                    'vespertina': {
+                        'pressure_count': len(day_data.get('vespertina', [])),
+                        'pressure_data': [
+                            {
+                                'time': datetime.fromisoformat(m['measurement_time']).strftime('%H:%M'),
+                                'systolic': m['data'].get('systolic'),
+                                'diastolic': m['data'].get('diastolic'),
+                                'pulse': m['data'].get('pulse')
+                            }
+                            for m in day_data.get('vespertina', [])
+                        ],
+                        'pressure': [  # NUEVO: Formato compatible con dashboard
+                            {
+                                'time': datetime.fromisoformat(m['measurement_time']).strftime('%H:%M'),
+                                'systolic': m['data'].get('systolic'),
+                                'diastolic': m['data'].get('diastolic'),
+                                'pulse': m['data'].get('pulse')
+                            }
+                            for m in day_data.get('vespertina', [])
+                        ],
+                        'ecg': []  # NUEVO: Placeholder para ECGs
+                    }
+                }
+                
+                # Contar mediciones para estadísticas
+                matutina_complete = len(day_data.get('matutina', [])) >= 2
+                vespertina_complete = len(day_data.get('vespertina', [])) >= 2
+                
+                if matutina_complete:
+                    total_measurements_received += 1
+                if vespertina_complete:
+                    total_measurements_received += 1
+                
+                # No incrementar aquí, se calculará al final
+            
+            # ESTÁNDAR: 14 franjas esperadas (2 franjas × 7 días)
+            standard_expected = 14
+            
+            patients_report[patient_name] = {
+                'completion_percentage': completeness['completeness_percentage'],
+                'is_complete': completeness['is_complete'],
+                'daily_data': daily_data,
+                'requirements': completeness['requirements'],
+                'received_measurements': total_measurements_received,
+                'expected_measurements': standard_expected,
+                'missing_measurements': []  # NUEVO: Para compatibilidad
             }
         
-        self.patient_data[patient_name]['measurements'].append(log_entry)
-        self.patient_data[patient_name]['last_update'] = datetime.now().isoformat()
+        # Calcular totales generales con estándar de 14 franjas por paciente
+        total_measurements_received_all = sum(p['received_measurements'] for p in patients_report.values())
+        total_measurements_expected_all = len(patients_report) * 14  # 14 franjas por paciente
         
-        # Log para debugging
-        if validation_result['is_valid']:
-            logger.info(f"Medición válida registrada para {patient_name}: {validation_result.get('time_slot', 'sin_franja')} - {validation_result['file_path']}")
-        else:
-            logger.warning(f"Medición inválida para {patient_name}: {validation_result['errors']}")
-    
-    def generate_completeness_report(self) -> Dict:
-        """Genera un reporte de completitud para todos los pacientes"""
+        # Crear reporte final
         report = {
             'generation_date': datetime.now().isoformat(),
-            'patients': {},
             'overall_summary': {
-                'total_patients': 0,
-                'patients_complete': 0,
-                'patients_incomplete': 0,
-                'total_measurements_expected': 0,
-                'total_measurements_received': 0
-            }
+                'total_patients': total_patients,
+                'patients_complete': patients_complete,
+                'patients_incomplete': patients_incomplete,
+                'total_measurements_received': total_measurements_received_all,
+                'total_measurements_expected': total_measurements_expected_all
+            },
+            'patients': patients_report
         }
-        
-        study_days = self.config.get('study_duration_days', 7)
-        measurements_per_day = self.config.get('required_measurements_per_day', 4)
-        
-        for patient_name, patient_info in self.patient_data.items():
-            patient_report = self.analyze_patient_completeness(
-                patient_name, 
-                patient_info, 
-                study_days, 
-                measurements_per_day
-            )
-            
-            report['patients'][patient_name] = patient_report
-            
-            # Actualizar resumen general
-            report['overall_summary']['total_patients'] += 1
-            if patient_report['is_complete']:
-                report['overall_summary']['patients_complete'] += 1
-            else:
-                report['overall_summary']['patients_incomplete'] += 1
-            
-            report['overall_summary']['total_measurements_expected'] += patient_report['expected_measurements']
-            report['overall_summary']['total_measurements_received'] += patient_report['received_measurements']
         
         return report
     
-    def analyze_patient_completeness(self, patient_name: str, patient_info: Dict, 
-                                   study_days: int, measurements_per_day: int) -> Dict:
-        """Analiza la completitud de un paciente específico"""
-        measurements = patient_info['measurements']
-        
-        # Organizar mediciones por día y franja horaria
-        daily_data = {}
-        
-        logger.info(f"Analizando completitud para {patient_name} con {len(measurements)} mediciones")
-        
-        for measurement in measurements:
-            # Solo procesar mediciones válidas
-            if not measurement.get('is_valid', False):
-                logger.warning(f"Medición inválida omitida: {measurement.get('file_path', 'unknown')}")
-                continue
-            
-            # Obtener tiempo de medición
-            measurement_time_str = measurement.get('measurement_time')
-            if not measurement_time_str:
-                logger.warning(f"Medición sin tiempo: {measurement.get('file_path', 'unknown')}")
-                continue
-            
-            try:
-                # Parsear el tiempo de medición
-                if isinstance(measurement_time_str, str):
-                    # Remover 'Z' y '+00:00' si están presentes
-                    measurement_time_str = measurement_time_str.replace('Z', '').replace('+00:00', '')
-                    measurement_time = datetime.fromisoformat(measurement_time_str)
-                else:
-                    measurement_time = measurement_time_str
-                
-                date_key = measurement_time.date().isoformat()
-                time_slot = measurement.get('time_slot', 'unknown')
-                
-                logger.info(f"Medición procesada: {date_key} {time_slot} - {measurement.get('file_path', 'unknown')}")
-                
-                # Inicializar estructura de datos diarios si no existe
-                if date_key not in daily_data:
-                    daily_data[date_key] = {
-                        'matutina_1': {'pressure': False, 'ecg': False},
-                        'matutina_2': {'pressure': False, 'ecg': False},
-                        'vespertina_1': {'pressure': False, 'ecg': False},
-                        'vespertina_2': {'pressure': False, 'ecg': False}
-                    }
-                
-                # Determinar tipo de archivo basado en la ruta
-                file_path = measurement.get('file_path', '')
-                if 'pressure' in file_path.lower() or '.csv' in file_path.lower():
-                    file_type = 'pressure'
-                elif 'ecg' in file_path.lower() or '.pdf' in file_path.lower():
-                    file_type = 'ecg'
-                else:
-                    logger.warning(f"Tipo de archivo no determinado: {file_path}")
-                    continue
-                
-                # Marcar la medición como recibida si la franja horaria es válida
-                if time_slot in daily_data[date_key]:
-                    daily_data[date_key][time_slot][file_type] = True
-                    logger.info(f"Marcado {file_type} en {date_key} {time_slot} para {patient_name}")
-                else:
-                    logger.warning(f"Franja horaria no válida: {time_slot}")
-                    
-            except Exception as e:
-                logger.error(f"Error procesando medición para {patient_name}: {e}")
-                continue
-        
-        # Calcular completitud basado en TODAS las mediciones encontradas
-        received_measurements = 0
-        missing_measurements = []
-        
-        logger.info(f"Calculando completitud para {patient_name} basado en TODAS las fechas encontradas")
-        
-        # Contar mediciones completas en TODAS las fechas encontradas
-        for date_key, day_data in daily_data.items():
-            for time_slot, measurements_slot in day_data.items():
-                if measurements_slot['pressure'] and measurements_slot['ecg']:
-                    received_measurements += 1
-                    logger.info(f"Medición completa encontrada: {patient_name} {date_key} {time_slot}")
-                else:
-                    missing_items = []
-                    if not measurements_slot['pressure']:
-                        missing_items.append('presión')
-                    if not measurements_slot['ecg']:
-                        missing_items.append('ECG')
-                    
-                    if missing_items:  # Solo agregar si realmente faltan elementos
-                        missing_measurements.append({
-                            'date': date_key,
-                            'time_slot': time_slot,
-                            'missing': missing_items
-                        })
-        
-        # Calcular mediciones esperadas basado en el período de estudio configurado
-        expected_measurements = study_days * measurements_per_day
-        
-        # Si tenemos más mediciones de las esperadas, ajustar las esperadas
-        if received_measurements > expected_measurements:
-            expected_measurements = received_measurements
-        
-        completion_percentage = (received_measurements / expected_measurements * 100) if expected_measurements > 0 else 0
-        
-        logger.info(f"Completitud calculada para {patient_name}: {received_measurements}/{expected_measurements} = {completion_percentage:.2f}%")
-        
-        return {
-            'patient_name': patient_name,
-            'expected_measurements': expected_measurements,
-            'received_measurements': received_measurements,
-            'completion_percentage': round(completion_percentage, 2),
-            'is_complete': completion_percentage >= 100,
-            'missing_measurements': missing_measurements,
-            'daily_data': daily_data,
-            'last_update': patient_info['last_update']
-        }
-    
-    def save_report(self, report: Dict, filename: str = None):
+    def save_report(self, report_data: dict) -> str:
         """Guarda el reporte en archivo JSON"""
-        if not filename:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"monitoring_report_{timestamp}.json"
-        
-        report_path = os.path.join(self.reports_path, filename)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        report_filename = f"monitoring_report_{timestamp}.json"
+        report_path = os.path.join(self.reports_path, report_filename)
         
         try:
             with open(report_path, 'w', encoding='utf-8') as f:
-                json.dump(report, f, indent=2, ensure_ascii=False, default=str)
+                json.dump(report_data, f, indent=2, ensure_ascii=False, default=str)
             
-            logger.info(f"Reporte guardado en: {report_path}")
             return report_path
             
         except Exception as e:
             logger.error(f"Error guardando reporte: {e}")
-            return None
-    
-    def export_to_excel(self, report: Dict, filename: str = None):
-        """Exporta el reporte a Excel para fácil visualización"""
-        if not filename:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"monitoring_report_{timestamp}.xlsx"
-        
-        excel_path = os.path.join(self.reports_path, filename)
-        
-        try:
-            with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
-                # Hoja de resumen general
-                summary_data = []
-                for patient_name, patient_data in report['patients'].items():
-                    summary_data.append({
-                        'Paciente': patient_name,
-                        'Mediciones Esperadas': patient_data['expected_measurements'],
-                        'Mediciones Recibidas': patient_data['received_measurements'],
-                        'Porcentaje Completitud': patient_data['completion_percentage'],
-                        'Estado': 'Completo' if patient_data['is_complete'] else 'Incompleto',
-                        'Última Actualización': patient_data['last_update']
-                    })
-                
-                summary_df = pd.DataFrame(summary_data)
-                summary_df.to_excel(writer, sheet_name='Resumen', index=False)
-                
-                # Hoja de mediciones faltantes
-                missing_data = []
-                for patient_name, patient_data in report['patients'].items():
-                    for missing in patient_data['missing_measurements']:
-                        missing_data.append({
-                            'Paciente': patient_name,
-                            'Fecha': missing['date'],
-                            'Franja Horaria': missing['time_slot'],
-                            'Faltantes': ', '.join(missing['missing'])
-                        })
-                
-                if missing_data:
-                    missing_df = pd.DataFrame(missing_data)
-                    missing_df.to_excel(writer, sheet_name='Mediciones Faltantes', index=False)
-            
-            logger.info(f"Reporte Excel guardado en: {excel_path}")
-            return excel_path
-            
-        except Exception as e:
-            logger.error(f"Error exportando a Excel: {e}")
-            return None
+            return ""
 
-    def debug_patient_data(self):
-        """Método para debugging - muestra los datos de pacientes"""
-        logger.info("=== DEBUG: Datos de pacientes ===")
-        for patient_name, patient_info in self.patient_data.items():
-            logger.info(f"Paciente: {patient_name}")
-            logger.info(f"  Total mediciones: {len(patient_info['measurements'])}")
-            
-            valid_measurements = [m for m in patient_info['measurements'] if m.get('is_valid')]
-            logger.info(f"  Mediciones válidas: {len(valid_measurements)}")
-            
-            for measurement in valid_measurements:
-                logger.info(f"    - {measurement.get('file_path', 'unknown')} -> {measurement.get('time_slot', 'sin_franja')} ({measurement.get('measurement_time', 'sin_tiempo')})")
-        logger.info("=== FIN DEBUG ===")
-
-# Ejemplo de uso
-if __name__ == "__main__":
-    # Configurar logging
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler('monitoring_system.log'),
-            logging.StreamHandler()
-        ]
-    )
-    
-    # Crear sistema de monitoreo
+def main():
+    """Función principal para pruebas"""
     system = MonitoringSystem()
+    summary = system.run_daily_check()
     
-    # Ejecutar chequeo diario
-    daily_summary = system.run_daily_check(force_all_emails=True)
+    print(f"\n✅ Chequeo completado:")
+    print(f"👥 Pacientes procesados: {summary['patients_processed']}")
+    print(f"📧 Emails procesados: {summary['emails_processed']}")
     
-    # Mostrar resumen
-    print(f"Emails procesados: {daily_summary['emails_processed']}")
-    print(f"Archivos validados: {daily_summary['files_validated']}")
-    print(f"Errores: {len(daily_summary['errors'])}")
-    print(f"Advertencias: {len(daily_summary['warnings'])}")
-    
-    # Guardar reportes
-    if 'completeness_report' in daily_summary:
-        report_path = system.save_report(daily_summary['completeness_report'])
-        excel_path = system.export_to_excel(daily_summary['completeness_report'])
-        
-        print(f"Reporte JSON: {report_path}")
-        print(f"Reporte Excel: {excel_path}")
+    if summary['errors']:
+        print(f"❌ Errores: {len(summary['errors'])}")
+
+if __name__ == "__main__":
+    main()

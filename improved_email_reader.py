@@ -15,27 +15,17 @@ from email.utils import parsedate_to_datetime
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-class EmailReader:
-    def __init__(self, config_file: str = "config.json"):
+class ImprovedEmailReader:
+    def __init__(self, email_config: Dict[str, str]):
         """
         Inicializa el lector de emails mejorado
         
         Args:
-            config_file: Ruta al archivo de configuración JSON
+            email_config: Diccionario con configuración del email
         """
-        # Cargar configuración desde archivo
-        import json
-        try:
-            with open(config_file, 'r', encoding='utf-8') as f:
-                config = json.load(f)
-            email_config = config.get('email', {})
-        except Exception as e:
-            logger.error(f"Error cargando configuración: {e}")
-            email_config = {}
-        
-        self.server = email_config.get('server', 'imap.gmail.com')
-        self.email = email_config.get('email', '')
-        self.password = email_config.get('password', '')
+        self.server = email_config['server']
+        self.email = email_config['email']
+        self.password = email_config['password']
         self.port = email_config.get('port', 993)
         self.mail = None
         self.processed_ids = set()
@@ -398,26 +388,18 @@ class EmailReader:
                     with open(temp_path, 'wb') as f:
                         f.write(attachment['content'])
                     
-                    # NUEVA LÓGICA: Extraer fecha del contenido del PDF y resolver ambigüedad AM/PM
-                    ecg_date, has_ambiguity = self.extract_ecg_date_from_content_with_ambiguity(temp_path)
+                    # Extraer fecha del contenido del PDF
+                    ecg_date = self.extract_ecg_date_from_content(temp_path)
                     
                     if ecg_date:
-                        if has_ambiguity:
-                            # Resolver ambigüedad usando archivos de presión
-                            resolved_date = self.resolve_am_pm_ambiguity_with_pressure(ecg_date, patient_dir)
-                            date_str = resolved_date.strftime("%Y-%m-%d_%H-%M-%S")
-                            new_filename = f"ecg_{date_str}.pdf"
-                            logger.info(f"ECG con ambigüedad AM/PM resuelta: {ecg_date} -> {resolved_date}")
-                        else:
-                            # No hay ambigüedad, usar fecha tal como está
-                            date_str = ecg_date.strftime("%Y-%m-%d_%H-%M-%S")
-                            new_filename = f"ecg_{date_str}.pdf"
-                            logger.info(f"ECG sin ambigüedad: {ecg_date}")
+                        # Si hay ambigüedad AM/PM, resolver usando archivos de presión
+                        resolved_date = self.resolve_am_pm_ambiguity(ecg_date, patient_dir)
+                        date_str = resolved_date.strftime("%Y-%m-%d_%H-%M-%S")
+                        new_filename = f"ecg_{date_str}.pdf"
                     else:
                         # Fallback: usar fecha del email
                         email_timestamp = email_date.strftime("%Y-%m-%d_%H-%M-%S")
                         new_filename = f"ecg_{email_timestamp}_{i}.pdf"
-                        logger.warning(f"No se pudo extraer fecha del ECG, usando fecha del email")
                     
                     # Renombrar archivo temporal
                     final_path = os.path.join(patient_dir, new_filename)
@@ -451,11 +433,8 @@ class EmailReader:
             'saved_files': saved_files
         }
     
-    def extract_ecg_date_from_content_with_ambiguity(self, pdf_path: str) -> Tuple[Optional[datetime], bool]:
-        """
-        NUEVA FUNCIÓN: Extrae la fecha del contenido del PDF de ECG y detecta ambigüedad AM/PM
-        Retorna: (datetime, has_ambiguity)
-        """
+    def extract_ecg_date_from_content(self, pdf_path: str) -> Optional[datetime]:
+        """Extrae la fecha del contenido del PDF de ECG"""
         try:
             import pdfplumber
             
@@ -467,10 +446,7 @@ class EmailReader:
                         full_text += page_text + "\n"
                 
                 if not full_text.strip():
-                    return None, False
-                
-                # Detectar si hay indicadores explícitos de AM/PM
-                has_am_pm = 'am' in full_text.lower() or 'pm' in full_text.lower() or 'a.m.' in full_text.lower() or 'p.m.' in full_text.lower()
+                    return None
                 
                 # Buscar patrones de fecha en el texto
                 datetime_patterns = [
@@ -499,36 +475,30 @@ class EmailReader:
                             
                             month = months_es.get(month_name.lower())
                             if month:
-                                hour_int = int(hour)
-                                
-                                # Detectar ambigüedad: hora entre 1-12 sin AM/PM explícito
-                                has_ambiguity = (1 <= hour_int <= 12) and not has_am_pm
-                                
+                                # NOTA: Aquí puede haber ambigüedad AM/PM
+                                # Devolvemos la fecha sin resolver la ambigüedad
                                 measurement_time = datetime(
                                     int(year), month, int(day),
-                                    hour_int, int(minute), int(second)
+                                    int(hour), int(minute), int(second)
                                 )
-                                
-                                logger.info(f"Fecha extraída del ECG: {measurement_time}, ambigüedad: {has_ambiguity}")
-                                return measurement_time, has_ambiguity
+                                logger.info(f"Fecha extraída del ECG: {measurement_time}")
+                                return measurement_time
                                 
                         except Exception as e:
                             logger.warning(f"Error parseando fecha del ECG: {e}")
                             continue
                 
-                return None, False
+                return None
                 
         except Exception as e:
             logger.error(f"Error extrayendo fecha del ECG: {e}")
-            return None, False
+            return None
     
-    def resolve_am_pm_ambiguity_with_pressure(self, ecg_date: datetime, patient_dir: str) -> datetime:
+    def resolve_am_pm_ambiguity(self, ecg_date: datetime, patient_dir: str) -> datetime:
         """
-        NUEVA FUNCIÓN: Resuelve la ambigüedad AM/PM usando el archivo de presión más cercano (±2 minutos)
+        Resuelve la ambigüedad AM/PM usando el archivo de presión más cercano
         """
         try:
-            logger.info(f"Resolviendo ambigüedad AM/PM para ECG: {ecg_date}")
-            
             # Buscar archivos de presión en el directorio del paciente
             pressure_files = []
             for file in os.listdir(patient_dir):
@@ -540,89 +510,108 @@ class EmailReader:
                 logger.warning("No se encontraron archivos de presión para resolver ambigüedad AM/PM")
                 return ecg_date
             
-            # Extraer todas las mediciones de presión del mismo día
-            ecg_date_only = ecg_date.date()
-            pressure_measurements = []
+            # Seleccionar el archivo de presión con más registros
+            best_pressure_file = self.select_best_pressure_file(pressure_files)
             
-            for pressure_file in pressure_files:
-                try:
-                    df = pd.read_csv(pressure_file, encoding='utf-8')
-                    
-                    # Buscar columna de fecha
-                    date_columns = [col for col in df.columns if 'fecha' in col.lower() or 'date' in col.lower()]
-                    
-                    if date_columns:
-                        date_col = date_columns[0]
-                        
-                        for _, row in df.iterrows():
-                            try:
-                                date_str = str(row[date_col])
-                                parsed_date = pd.to_datetime(date_str)
-                                
-                                if pd.notna(parsed_date):
-                                    pressure_dt = parsed_date.to_pydatetime()
-                                    
-                                    # Solo considerar mediciones del mismo día
-                                    if pressure_dt.date() == ecg_date_only:
-                                        pressure_measurements.append(pressure_dt)
-                                        logger.info(f"Medición de presión encontrada: {pressure_dt}")
-                            except Exception:
-                                continue
-                
-                except Exception as e:
-                    logger.warning(f"Error leyendo archivo de presión {pressure_file}: {e}")
-                    continue
-            
-            if not pressure_measurements:
-                logger.warning("No se encontraron mediciones de presión del mismo día")
+            if not best_pressure_file:
                 return ecg_date
+            
+            # Leer el archivo de presión y buscar mediciones cercanas
+            pressure_times = self.extract_pressure_times(best_pressure_file)
             
             # Buscar la medición de presión más cercana (±2 minutos)
-            ecg_hour = ecg_date.hour
-            ecg_minute = ecg_date.minute
+            closest_time = self.find_closest_pressure_time(ecg_date, pressure_times)
             
-            closest_pressure = None
-            min_diff_minutes = float('inf')
-            resolved_hour = ecg_hour
+            if closest_time:
+                # Ajustar la hora del ECG basándose en la medición de presión más cercana
+                time_diff = abs((closest_time.hour - ecg_date.hour) % 12)
+                
+                if time_diff <= 2:  # Si la diferencia es pequeña, usar la misma parte del día
+                    resolved_date = ecg_date.replace(
+                        hour=closest_time.hour,
+                        minute=closest_time.minute,
+                        second=closest_time.second
+                    )
+                    logger.info(f"Ambigüedad AM/PM resuelta: {ecg_date} -> {resolved_date}")
+                    return resolved_date
             
-            for pressure_dt in pressure_measurements:
-                pressure_minutes = pressure_dt.hour * 60 + pressure_dt.minute
-                
-                # Probar tanto AM como PM para el ECG
-                ecg_am_minutes = ecg_hour * 60 + ecg_minute
-                ecg_pm_minutes = (ecg_hour + 12) * 60 + ecg_minute if ecg_hour < 12 else ecg_hour * 60 + ecg_minute
-                
-                # Calcular diferencias
-                diff_am = abs(pressure_minutes - ecg_am_minutes)
-                diff_pm = abs(pressure_minutes - ecg_pm_minutes)
-                
-                # Elegir la menor diferencia dentro del rango de 2 minutos
-                if diff_am <= 2 and diff_am < min_diff_minutes:
-                    min_diff_minutes = diff_am
-                    closest_pressure = pressure_dt
-                    resolved_hour = ecg_hour  # Mantener AM
-                    logger.info(f"Candidato AM encontrado: diferencia {diff_am} minutos con {pressure_dt}")
-                
-                if diff_pm <= 2 and diff_pm < min_diff_minutes:
-                    min_diff_minutes = diff_pm
-                    closest_pressure = pressure 
-                    min_diff_minutes = diff_pm
-                    closest_pressure = pressure_dt
-                    resolved_hour = ecg_hour + 12 if ecg_hour < 12 else ecg_hour  # Convertir a PM
-                    logger.info(f"Candidato PM encontrado: diferencia {diff_pm} minutos con {pressure_dt}")
+            return ecg_date
             
-            if closest_pressure:
-                # Resolver la ambigüedad usando la medición de presión más cercana
-                resolved_datetime = ecg_date.replace(hour=resolved_hour)
-                logger.info(f"AMBIGÜEDAD RESUELTA: {ecg_date} -> {resolved_datetime} (basado en presión: {closest_pressure})")
-                return resolved_datetime
-            else:
-                logger.warning("No se encontró medición de presión cercana (±2 minutos)")
-                return ecg_date
-                
         except Exception as e:
             logger.error(f"Error resolviendo ambigüedad AM/PM: {e}")
             return ecg_date
+    
+    def select_best_pressure_file(self, pressure_files: List[str]) -> Optional[str]:
+        """Selecciona el archivo de presión con más registros"""
+        best_file = None
+        max_records = 0
+        
+        for file_path in pressure_files:
+            try:
+                df = pd.read_csv(file_path, encoding='utf-8')
+                record_count = len(df)
+                
+                if record_count > max_records:
+                    max_records = record_count
+                    best_file = file_path
+                    
+            except Exception as e:
+                logger.warning(f"Error leyendo archivo de presión {file_path}: {e}")
+                continue
+        
+        if best_file:
+            logger.info(f"Archivo de presión seleccionado: {best_file} ({max_records} registros)")
+        
+        return best_file
+    
+    def extract_pressure_times(self, pressure_file: str) -> List[datetime]:
+        """Extrae todas las fechas/horas del archivo de presión"""
+        times = []
+        
+        try:
+            df = pd.read_csv(pressure_file, encoding='utf-8')
+            
+            # Buscar columna de fecha
+            date_columns = [col for col in df.columns if 'fecha' in col.lower() or 'date' in col.lower()]
+            
+            if date_columns:
+                date_col = date_columns[0]
+                
+                for _, row in df.iterrows():
+                    try:
+                        date_str = str(row[date_col])
+                        # Parsear diferentes formatos de fecha
+                        parsed_date = pd.to_datetime(date_str)
+                        if pd.notna(parsed_date):
+                            times.append(parsed_date.to_pydatetime())
+                    except Exception:
+                        continue
+        
+        except Exception as e:
+            logger.error(f"Error extrayendo tiempos de presión: {e}")
+        
+        return times
+    
+    def find_closest_pressure_time(self, ecg_date: datetime, pressure_times: List[datetime]) -> Optional[datetime]:
+        """Encuentra la medición de presión más cercana al ECG (±2 minutos)"""
+        closest_time = None
+        min_diff = timedelta(minutes=2)  # Máximo 2 minutos de diferencia
+        
+        for pressure_time in pressure_times:
+            # Comparar solo considerando la misma fecha
+            if pressure_time.date() == ecg_date.date():
+                # Calcular diferencia en minutos (ignorando segundos)
+                ecg_minutes = ecg_date.hour * 60 + ecg_date.minute
+                pressure_minutes = pressure_time.hour * 60 + pressure_time.minute
+                
+                diff = abs(ecg_minutes - pressure_minutes)
+                
+                if diff <= 2:  # Dentro del rango de 2 minutos
+                    if closest_time is None or diff < min_diff.total_seconds() / 60:
+                        closest_time = pressure_time
+                        min_diff = timedelta(minutes=diff)
+        
+        return closest_time
     
     def disconnect(self):
         """Cierra la conexión al servidor de email"""
@@ -633,36 +622,3 @@ class EmailReader:
                 logger.info("Desconectado del servidor de email")
             except Exception as e:
                 logger.warning(f"Error cerrando conexión: {e}")
-
-    def download_all_attachments(self) -> dict:
-        """
-        Descarga todos los adjuntos de emails
-        
-        Returns:
-            Diccionario con resumen de descarga
-        """
-        try:
-            if not self.connect():
-                return {'emails_processed': 0, 'files_downloaded': 0, 'errors': ['No se pudo conectar al email']}
-            
-            emails = self.get_new_emails(force_all=True)
-            
-            files_downloaded = 0
-            for email_data in emails:
-                saved_info = self.save_attachments(email_data)
-                files_downloaded += len(saved_info.get('saved_files', []))
-            
-            self.disconnect()
-            
-            return {
-                'emails_processed': len(emails),
-                'files_downloaded': files_downloaded,
-                'errors': []
-            }
-            
-        except Exception as e:
-            return {
-                'emails_processed': 0,
-                'files_downloaded': 0,
-                'errors': [str(e)]
-            }
